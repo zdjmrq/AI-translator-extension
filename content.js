@@ -497,6 +497,17 @@ document.addEventListener('contextmenu', (e) => {
   lastContextMenuPos.y = e.clientY + window.scrollY;
 });
 
+// ── 检测是否在输入框/搜索框/编辑器内（用户正在编辑，不触发）──
+function isEditingElement() {
+  const el = document.activeElement;
+  if (!el) return false;
+  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') return true;
+  if (el.isContentEditable) return true;
+  const role = el.getAttribute('role');
+  if (role === 'searchbox' || role === 'textbox') return true;
+  return false;
+}
+
 // ── mouseup 自动触发（auto 模式：分类 → 智能解释）──
 document.addEventListener('mouseup', (e) => {
   if (isInTooltip(e.target)) return;
@@ -504,6 +515,7 @@ document.addEventListener('mouseup', (e) => {
 
   clearTimeout(selectionDebounce);
   selectionDebounce = setTimeout(() => {
+    if (isEditingElement()) return;
     const sel = window.getSelection();
     const text = sel.toString().trim();
     if (!text || text.length < 2) {

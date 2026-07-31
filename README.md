@@ -29,7 +29,7 @@
 - **网页上下文**：自动提取选中文本所在段落的上下文，让结果更准确（可选开关）
 - **流式输出**：所有解释/翻译结果逐 token 打字机式呈现，即时反馈
 - **一键复制 / 下载**：将内容写入剪贴板或保存为 TXT 文件
-- **多模型**：支持 DeepSeek-V4-Flash、DeepSeek-V4-Pro、千问 Qwen3.7-Flash（暂不推荐使用千问模型）
+- **多模型**：支持 DeepSeek-V4-Flash、DeepSeek-V4-Pro、千问 Qwen3.7-Flash
 - **深度思考**：可选开启思考模式，支持高/最高两档思考强度（仅 DeepSeek V4-Pro）
 
 ### 全文翻译（右键空白处）
@@ -50,7 +50,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/siwenyu666-beep/AI-translator-extension.git
+git clone https://github.com/siwenyu666-beep/siwenyudecangku.git
 ```
 
 克隆后可以删除 `.git` 文件夹与 `README.md` 文件（不影响扩展运行），保持文件夹干净。
