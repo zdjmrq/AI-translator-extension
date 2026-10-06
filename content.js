@@ -639,6 +639,13 @@ document.addEventListener('mouseup', (e) => {
     if (isEditingElement()) return;
     const sel = window.getSelection();
     const text = sel.toString().trim();
+    if (lastOutsideClosedText !== null) {
+      const closedText = lastOutsideClosedText;
+      lastOutsideClosedText = null;
+      // 点击外部若是让选区折叠则 text 为空，本就不会重开；
+      // 若页面阻止默认行为导致选区不变，则保持“已关闭”状态。
+      if (!text || text === closedText) return;
+    }
     if (!text || text.length < 2) {
       return;
     }
@@ -660,7 +667,51 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
-// 弹窗只允许手动点 × 关闭：不再监听 mouseleave / 外部点击 / Esc / selectionchange 自动关闭。
+// 弹窗支持点击外部或按 Esc 关闭；点击/滚动弹窗内部不会误关闭。
+// 鼠标移出、选区折叠仍不自动关闭，避免阅读长结果时被意外打断。
+function isTooltipVisible() {
+  return !!tooltip && tooltip.classList.contains('ds-visible');
+}
+
+function isEventInsideTooltip(e) {
+  if (isInTooltip(e.target)) return true;
+  return typeof e.composedPath === 'function' && e.composedPath().includes(tooltip);
+}
+
+// 记录本次“点击外部关闭”前选中的文本：若这次 mouseup 选区没有变化，
+// 不再自动重新打开，避免页面阻止了默认行为时弹窗刚关又开。
+let lastOutsideClosedText = null;
+
+function clearSelectionDebounce() {
+  if (selectionDebounce) {
+    clearTimeout(selectionDebounce);
+    selectionDebounce = null;
+  }
+}
+
+function handleDocumentPointerDown(e) {
+  if (e.button !== 0) return; // 仅左键/触摸主按键关闭，右键留给上下文菜单
+  clearSelectionDebounce();
+  lastOutsideClosedText = null; // 新的指针交互开始后，旧的抑制标记失效
+  if (!isTooltipVisible()) return;
+  if (isEventInsideTooltip(e)) return;
+
+  lastOutsideClosedText = currentText;
+  hideTooltip();
+}
+
+function handleDocumentKeyDown(e) {
+  if (e.isComposing) return;
+  if (e.key !== 'Escape') return;
+  clearSelectionDebounce();
+  if (!isTooltipVisible()) return;
+  hideTooltip();
+}
+
+// 使用 pointerdown 捕获阶段：点击外部立刻关闭，同时不干扰弹窗内部按钮/复制/滚动操作。
+document.addEventListener('pointerdown', handleDocumentPointerDown, true);
+document.addEventListener('keydown', handleDocumentKeyDown, true);
+
 // 滚动时仅在有选区坐标时重新定位，不因为选区折叠而隐藏。
 window.addEventListener('scroll', () => {
   if (!tooltip?.classList.contains('ds-visible')) return;

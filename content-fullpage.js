@@ -7,13 +7,14 @@
 
   // 防止重复注入；若已激活（用户再次触发全文翻译）
   if (window.__dsFullPageTranslatorActive) {
-    const progress = window.__dsFullPageTranslator?.progress;
-    if (progress && progress.completed < progress.total) {
+    const api = window.__dsFullPageTranslator;
+    const progress = api?.progress;
+    if (api?.busy || (progress && progress.completed < progress.total)) {
       const tb = document.getElementById('ds-translate-toolbar');
       const status = tb?.querySelector('.ds-tb-status');
       if (status) status.textContent = '⏳ 正在翻译中，请等待完成…';
     } else {
-      window.__dsFullPageTranslator?.start?.().catch?.(console.error);
+      api?.start?.().catch?.(console.error);
     }
     return;
   }
@@ -34,8 +35,7 @@
   // ═══════════════════════════════════════════
 
   const translatedElements = new Set();
-  const originalHTML = new Map();       // element → 原始 innerHTML
-  const translatedHTML = new Map();     // element → 当前译文 innerHTML，用于切换原文
+  const originalTextSnapshots = new Map(); // element → { nodes: Text[], values: string[] } 原始文本节点快照
   let toolbar = null;
   let observer = null;
   let mutationObserver = null;
@@ -45,6 +45,8 @@
   let failedBlocks = 0;
   let aborted = false;
   let showingOriginal = false;
+  let sessionId = 0;          // 每次 start/cancel 递增，隔离旧端口/队列回调
+  let starting = false;       // 防止重复 start 并发安装观察器/任务
 
   // 块任务：稳定 id → element，保证批量返回后按 id 落盘，不依赖模型输出顺序
   let taskSeq = 0;
@@ -159,8 +161,9 @@
     return blocks;
   }
 
-  // 落盘译文：保留原有结构，只替换文本节点
-  function applyTranslation(el, buffer) {
+  // 收集当前块内与 applyTranslation 替换规则一致的文本节点。
+  // 跳过块级后代与脚本/控件等不可翻译元素内部，保持嵌套结构不被破坏。
+  function collectTextNodes(el) {
     const textNodes = [];
     (function walk(node) {
       for (const child of node.childNodes) {
@@ -172,7 +175,34 @@
         }
       }
     })(el);
+    return textNodes;
+  }
 
+  // 记录块内每个文本节点的原始值；切换原文/取消时仅还原文本节点，
+  // 不再用 innerHTML 整体替换，避免嵌套块引用失效和异步回填闪烁。
+  function captureOriginalText(el) {
+    if (originalTextSnapshots.has(el)) return;
+    const nodes = collectTextNodes(el);
+    originalTextSnapshots.set(el, {
+      nodes,
+      values: nodes.map(node => node.textContent)
+    });
+  }
+
+  function restoreOriginalText(el) {
+    const snapshot = originalTextSnapshots.get(el);
+    if (!snapshot) return;
+    const { nodes, values } = snapshot;
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (!node.isConnected) continue;
+      if (node.textContent !== values[i]) node.textContent = values[i];
+    }
+  }
+
+  // 落盘译文：保留原有结构，只替换文本节点
+  function applyTranslation(el, buffer) {
+    const textNodes = collectTextNodes(el);
     if (textNodes.length === 0) return;
     textNodes[0].textContent = buffer;
     for (let i = 1; i < textNodes.length; i++) textNodes[i].textContent = '';
@@ -214,24 +244,53 @@
   // 还原 & 取消
   // ═══════════════════════════════════════════
 
+  function restoreAllOriginal() {
+    for (const [el] of originalTextSnapshots) {
+      const task = taskByEl.get(el);
+      if (task?.indicator) {
+        task.indicator.remove();
+        task.indicator = null;
+      }
+      restoreOriginalText(el);
+      el.removeAttribute('data-ds-original');
+      el.removeAttribute('data-ds-translated');
+      el.removeAttribute('data-ds-translation');
+      el.removeAttribute('data-ds-failed');
+    }
+  }
+
   function toggleOriginal() {
     showingOriginal = !showingOriginal;
     const btn = document.getElementById('ds-tb-show-original');
     if (btn) btn.textContent = showingOriginal ? '显示译文' : '显示原文';
 
-    for (const [el, html] of originalHTML) {
-      if (showingOriginal) {
-        translatedHTML.set(el, el.innerHTML);
-        el.innerHTML = html;
-      } else {
-        const translation = translatedHTML.get(el);
-        if (translation) el.innerHTML = translation;
+    if (showingOriginal) {
+      // 切回原文：只移掉翻译中标记并还原文本节点值；进行中的请求继续跑，
+      // 完成后只记录译文，不再动当前 DOM，等用户切回译文时统一回填。
+      for (const [el] of originalTextSnapshots) {
+        const task = taskByEl.get(el);
+        if (task?.indicator) {
+          task.indicator.remove();
+          task.indicator = null;
+        }
+        restoreOriginalText(el);
+      }
+      return;
+    }
+
+    // 切回译文：对已完成/在切换前已完成的块重新落盘。仍在请求中的块完成后
+    // 会走 finishBlock 的 showingOriginal === false 分支自动落盘。
+    for (const [el] of originalTextSnapshots) {
+      const task = taskByEl.get(el);
+      if (task && task.translatedText !== undefined) {
+        applyTranslation(el, task.translatedText);
       }
     }
   }
 
   function cancel() {
     aborted = true;
+    sessionId++; // 立即让本轮旧的 done/error/onDisconnect 回调全部失效
 
     for (const port of activeStreamPorts) {
       try { port.disconnect(); } catch {}
@@ -242,25 +301,19 @@
     if (mutationObserver) mutationObserver.disconnect();
     if (queue) queue.reset();
 
-    for (const [el, html] of originalHTML) {
-      el.innerHTML = html;
-      el.removeAttribute('data-ds-original');
-      el.removeAttribute('data-ds-translated');
-      el.removeAttribute('data-ds-translation');
-      el.removeAttribute('data-ds-failed');
-    }
+    restoreAllOriginal();
 
     if (toolbar) toolbar.remove();
 
     translatedElements.clear();
-    originalHTML.clear();
-    translatedHTML.clear();
+    originalTextSnapshots.clear();
     taskById.clear();
     taskByEl = new WeakMap();
     taskSeq = 0;
     totalBlocks = 0;
     completedBlocks = 0;
     failedBlocks = 0;
+    showingOriginal = false;
     window.__dsFullPageTranslatorActive = false;
   }
 
@@ -283,7 +336,8 @@
       index: taskSeq,             // DOM 顺序，用于相邻块批处理
       status: 'pending',
       indicator: null,
-      viewportTop: 0
+      viewportTop: 0,
+      sessionId
     };
     taskByEl.set(el, task);
     taskById.set(id, task);
@@ -291,7 +345,7 @@
   }
 
   function prepareTask(task) {
-    if (aborted) return false;
+    if (aborted || task.sessionId !== sessionId) return false;
     const el = task.el;
 
     if (!el.isConnected) {
@@ -302,11 +356,16 @@
       return false;
     }
 
-    if (!originalHTML.has(el)) originalHTML.set(el, el.innerHTML);
+    captureOriginalText(el);
     el.setAttribute('data-ds-original', 'true');
-    el.insertAdjacentHTML('afterbegin',
-      '<span class="ds-translating-indicator"><span class="ds-dot"></span>翻译中</span>');
-    task.indicator = el.querySelector('.ds-translating-indicator');
+    if (showingOriginal) {
+      // 用户当前选择看原文：后台继续翻译，但不插入会影响阅读的“翻译中”标记
+      task.indicator = null;
+    } else {
+      el.insertAdjacentHTML('afterbegin',
+        '<span class="ds-translating-indicator"><span class="ds-dot"></span>翻译中</span>');
+      task.indicator = el.querySelector('.ds-translating-indicator');
+    }
     task.status = 'running';
     return true;
   }
@@ -319,25 +378,46 @@
     if (task.status !== 'done') task.status = 'pending';
   }
 
-  function finishBlock(el, translatedText, indicator) {
-    indicator?.remove();
+  function finishBlock(task, translatedText) {
+    if (!task) return;
+    const el = task.el;
+    task.indicator?.remove();
+    task.indicator = null;
+
+    // 取消/重新开始后，旧请求可能才收到 done/error/disconnect，必须丢弃。
+    if (task.sessionId !== sessionId || aborted) return;
+
+    // 防御 done + onDisconnect 等重复回调，确保只结算一次。
+    if (task.status === 'done' || task.status === 'failed') return;
+
     if (!el.isConnected) {
+      task.status = 'done';
       el.setAttribute('data-ds-translated', 'true');
+      originalTextSnapshots.delete(el);
+      taskById.delete(task.id);
+      taskByEl.delete(el);
+      translatedElements.delete(el);
       if (totalBlocks > 0) totalBlocks--;
       updateProgress();
       return;
     }
 
     if (translatedText !== undefined && translatedText.trim()) {
-      applyTranslation(el, translatedText);
+      // 无论当前是否显示原文，都先把译文存到任务上；只有当前正在显示译文
+      // 时才立即落盘。这样“显示原文”期间完成的请求不会把原文再次改掉。
+      task.translatedText = translatedText;
+      task.status = 'done';
+      if (!showingOriginal) applyTranslation(el, translatedText);
       el.removeAttribute('data-ds-failed');
     } else {
+      task.status = 'failed';
       failedBlocks++;
       el.setAttribute('data-ds-failed', 'true');
     }
 
     el.setAttribute('data-ds-translated', 'true');
     translatedElements.add(el);
+    taskById.delete(task.id);
     completedBlocks++;
     updateProgress();
   }
@@ -404,9 +484,13 @@
         if (batch.length === 0) break;
 
         this.active++;
+        const requestSession = sessionId;
         translateBatchTasks(batch)
           .catch(() => {})
           .finally(() => {
+            // cancel/start 已切换会话时 queue.reset() 已把 active 归零，
+            // 旧请求的 finally 不能再扣减新一轮的 active。
+            if (requestSession !== sessionId) return;
             this.active--;
             this.process();
           });
@@ -418,7 +502,7 @@
 
   // 批量请求失败时，逐块回退；每块仍然用 done 一次性落盘
   async function translateSingleTask(task) {
-    if (aborted || task.status === 'done' || task.status === 'failed') return;
+    if (aborted || task.sessionId !== sessionId || task.status === 'done' || task.status === 'failed') return;
     if (!prepareTask(task)) return;
 
     let port;
@@ -427,8 +511,7 @@
         name: `stream-fp-${Date.now()}-${Math.random().toString(36).slice(2)}`
       });
     } catch {
-      finishBlock(task.el, undefined, task.indicator);
-      task.status = 'failed';
+      finishBlock(task, undefined);
       return;
     }
 
@@ -438,8 +521,7 @@
       let buffer = '';
       let finished = false;
 
-      const timeout = setTimeout(() => cleanup(false), 30000);
-      const cleanup = (ok) => {
+      const cleanup = () => {
         if (finished) return;
         finished = true;
         clearTimeout(timeout);
@@ -448,52 +530,59 @@
         resolve();
       };
 
+      const timeout = setTimeout(() => {
+        // 超时也要走统一结算，避免“翻译中”标记常驻、进度卡住
+        if (task.sessionId === sessionId && !aborted) finishBlock(task, undefined);
+        cleanup();
+      }, 30000);
+
       port.onMessage.addListener((msg) => {
-        if (aborted) { cleanup(false); return; }
+        if (task.sessionId !== sessionId || aborted) {
+          cleanup();
+          return;
+        }
         if (msg.type === 'token') {
           buffer += msg.token;
         } else if (msg.type === 'done') {
-          finishBlock(task.el, msg.text || buffer, task.indicator);
-          task.status = 'done';
-          taskById.delete(task.id);
-          cleanup(true);
+          finishBlock(task, msg.text || buffer);
+          cleanup();
         } else if (msg.type === 'error') {
-          finishBlock(task.el, undefined, task.indicator);
-          task.status = 'failed';
-          taskById.delete(task.id);
-          cleanup(false);
+          finishBlock(task, undefined);
+          cleanup();
         }
       });
 
       port.onDisconnect.addListener(() => {
         if (finished) return;
-        if (!aborted) {
-          finishBlock(task.el, undefined, task.indicator);
-          task.status = 'failed';
-          taskById.delete(task.id);
-        }
-        cleanup(false);
+        if (task.sessionId === sessionId && !aborted) finishBlock(task, undefined);
+        cleanup();
       });
 
-      port.postMessage({
-        type: 'STREAM_BATCH',
-        promptType: 'translate',
-        text: task.text,
-        context: { title: document.title, url: window.location.href },
-        batchId: `fp-${task.id}-${Date.now()}`
-      });
+      try {
+        port.postMessage({
+          type: 'STREAM_BATCH',
+          promptType: 'translate',
+          text: task.text,
+          context: { title: document.title, url: window.location.href },
+          batchId: `fp-${task.id}-${Date.now()}`
+        });
+      } catch {
+        if (task.sessionId === sessionId && !aborted) finishBlock(task, undefined);
+        cleanup();
+      }
     });
   }
 
   async function translateBatchTasks(tasks) {
-    if (aborted || tasks.length === 0) return;
+    const requestSession = sessionId;
+    if (aborted || requestSession !== sessionId || tasks.length === 0) return;
 
     const prepared = [];
     for (const task of tasks) {
-      if (!task || task.status === 'done' || task.status === 'failed') continue;
+      if (!task || task.sessionId !== sessionId || task.status === 'done' || task.status === 'failed') continue;
       if (prepareTask(task)) prepared.push(task);
     }
-    if (prepared.length === 0) return;
+    if (requestSession !== sessionId || prepared.length === 0) return;
 
     // 单块没必要走批量协议，直接走单块回退路径
     if (prepared.length === 1) {
@@ -510,6 +599,7 @@
       });
     } catch {
       for (const task of prepared) {
+        if (task.sessionId !== sessionId || aborted) continue;
         cleanupBatchTask(task);
         translateSingleTask(task).catch(() => {});
       }
@@ -520,6 +610,7 @@
 
     return new Promise((resolve) => {
       let finished = false;
+      let timeout = 0;
 
       const finish = (success, msg) => {
         if (finished) return;
@@ -527,23 +618,23 @@
         clearTimeout(timeout);
         activeStreamPorts.delete(port);
 
+        // 旧会话：只关闭端口，不结算旧任务，更不能触碰新一轮 DOM/计数
+        if (requestSession !== sessionId || aborted) {
+          try { port.disconnect(); } catch {}
+          resolve();
+          return;
+        }
+
         if (success && msg && Array.isArray(msg.items)) {
           const resultMap = new Map(msg.items.map(item => [String(item.id), item.text]));
           for (const task of prepared) {
-            const text = resultMap.get(task.id);
-            if (text !== undefined) {
-              finishBlock(task.el, text, task.indicator);
-              task.status = 'done';
-            } else {
-              finishBlock(task.el, undefined, task.indicator);
-              task.status = 'failed';
-            }
-            taskById.delete(task.id);
+            if (task.sessionId !== sessionId) continue;
+            finishBlock(task, resultMap.has(task.id) ? resultMap.get(task.id) : undefined);
           }
         } else {
           // 批量结构错误/网络错误：降级为单块请求，位置不受影响
           for (const task of prepared) cleanupBatchTask(task);
-          if (!aborted) {
+          if (requestSession === sessionId && !aborted) {
             for (const task of prepared) {
               translateSingleTask(task).catch(() => {});
             }
@@ -554,10 +645,10 @@
         resolve();
       };
 
-      const timeout = setTimeout(() => finish(false), 60000);
+      timeout = setTimeout(() => finish(false), 60000);
 
       port.onMessage.addListener((msg) => {
-        if (aborted) { finish(false); return; }
+        if (aborted || requestSession !== sessionId) { finish(false); return; }
         if (msg.type === 'done') {
           finish(true, msg);
         } else if (msg.type === 'error') {
@@ -570,12 +661,16 @@
         finish(false);
       });
 
-      port.postMessage({
-        type: 'STREAM_TRANSLATE_BATCH',
-        items: prepared.map(task => ({ id: task.id, text: task.text })),
-        context: { title: document.title, url: window.location.href },
-        batchId: `fp-batch-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-      });
+      try {
+        port.postMessage({
+          type: 'STREAM_TRANSLATE_BATCH',
+          items: prepared.map(task => ({ id: task.id, text: task.text })),
+          context: { title: document.title, url: window.location.href },
+          batchId: `fp-batch-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+        });
+      } catch {
+        finish(false);
+      }
     });
   }
 
@@ -615,7 +710,8 @@
   // 启动入口
   // ═══════════════════════════════════════════
 
-  async function start() {
+  async function runStart() {
+    const startSession = ++sessionId;
     aborted = true;
     for (const port of activeStreamPorts) {
       try { port.disconnect(); } catch {}
@@ -626,14 +722,19 @@
     await new Promise(resolve => setTimeout(resolve, 0));
     await new Promise(resolve => setTimeout(resolve, 0));
 
+    // 用户在 start 的 await 期间取消/重启时，直接放弃本轮初始化
+    if (startSession !== sessionId) return;
+
+    // 先还原上一轮全文翻译，避免在已翻译的 DOM 上重新采集造成原文丢失
+    restoreAllOriginal();
+
     // 重置上一会话
     if (queue) queue.reset();
     taskById.clear();
     taskByEl = new WeakMap();
     taskSeq = 0;
     translatedElements.clear();
-    originalHTML.clear();
-    translatedHTML.clear();
+    originalTextSnapshots.clear();
     totalBlocks = 0;
     completedBlocks = 0;
     failedBlocks = 0;
@@ -644,6 +745,8 @@
       const config = await chrome.storage.local.get({ targetLanguage: 'zh' });
       targetLanguage = config.targetLanguage || 'zh';
     } catch {}
+
+    if (startSession !== sessionId) return;
 
     injectToolbar();
     const showOriginalBtn = document.getElementById('ds-tb-show-original');
@@ -709,14 +812,14 @@
               queue.queue = queue.queue.filter(item => item !== task);
               taskById.delete(task.id);
               taskByEl.delete(el);
+              originalTextSnapshots.delete(el);
               if (totalBlocks > 0) totalBlocks--;
               updateProgress();
             } else if (task.status === 'done') {
               taskById.delete(task.id);
               taskByEl.delete(el);
               translatedElements.delete(el);
-              originalHTML.delete(el);
-              translatedHTML.delete(el);
+              originalTextSnapshots.delete(el);
               if (totalBlocks > 0) totalBlocks--;
               if (completedBlocks > 0) completedBlocks--;
               updateProgress();
@@ -757,11 +860,24 @@
     });
   }
 
+  async function start() {
+    if (starting) return;
+    starting = true;
+    try {
+      await runStart();
+    } finally {
+      starting = false;
+    }
+  }
+
   // 暴露 API 到全局
   window.__dsFullPageTranslator = {
     start,
     cancel,
     toggleOriginal,
+    get busy() {
+      return starting || aborted || (totalBlocks > 0 && completedBlocks < totalBlocks);
+    },
     get progress() { return { completed: completedBlocks, total: totalBlocks }; }
   };
 
